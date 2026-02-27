@@ -1,0 +1,52 @@
+# Build directories
+build/
+out/
+cmake-build-*/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+_deps/
+
+# Compiled output
+*.exe
+*.dll
+*.lib
+*.a
+*.so
+*.so.*
+*.dylib
+*.pdb
+*.ilk
+*.exp
+
+# VS / MSVC
+.vs/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.VC.opendb
+ipch/
+
+# CLion
+.idea/
+cmake-build-debug/
+cmake-build-release/
+
+# VS Code
+.vscode/
+
+# Test output / temp recording sessions
+tests/tmp/
+*.rec
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db

@@ -11,6 +11,8 @@ project(recplay
 # ---------------------------------------------------------------------------
 option(RECPLAY_BUILD_TESTS    "Build unit tests"                    ON)
 option(RECPLAY_BUILD_TOOLS    "Build command-line tools (CLI)"      ON)
+option(RECPLAY_BUILD_EXAMPLES "Build example programs"              ON)
+option(RECPLAY_BUILD_APPS     "Build viewer + tools applications"   ON)
 option(RECPLAY_ENABLE_LZ4     "Enable LZ4 compression support"      ON)
 option(RECPLAY_ENABLE_ZSTD    "Enable Zstd compression support"     ON)
 option(RECPLAY_ENABLE_CRC     "Enable CRC32 checksums by default"   ON)
@@ -68,6 +70,20 @@ add_subdirectory(src)
 if(RECPLAY_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+# ---------------------------------------------------------------------------
+# Examples
+# ---------------------------------------------------------------------------
+if(RECPLAY_BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif()
+
+# ---------------------------------------------------------------------------
+# Applications (Viewer, etc.)
+# ---------------------------------------------------------------------------
+if(RECPLAY_BUILD_APPS)
+    add_subdirectory(apps)
 endif()
 
 # ---------------------------------------------------------------------------

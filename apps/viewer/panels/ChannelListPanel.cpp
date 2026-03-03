@@ -53,8 +53,9 @@ void ChannelListPanel::Draw(AppContext& ctx)
         ImGuiTableFlags_SizingStretchProp |
         ImGuiTableFlags_Resizable;
 
-    if (ImGui::BeginTable("channels", 6, flags)) {
+    if (ImGui::BeginTable("channels", 7, flags)) {
         ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Inspect",    ImGuiTableColumnFlags_WidthFixed, 54.f);
         ImGui::TableSetupColumn("",           ImGuiTableColumnFlags_WidthFixed, 20.f); // colour swatch
         ImGui::TableSetupColumn("Show",       ImGuiTableColumnFlags_WidthFixed, 38.f);
         ImGui::TableSetupColumn("Name",       ImGuiTableColumnFlags_WidthStretch);
@@ -69,9 +70,22 @@ void ChannelListPanel::Draw(AppContext& ctx)
             auto*       uis = ctx.FindChannelState(ch.Id);
 
             ImGui::TableNextRow();
+            ImGui::PushID(i);
+
+            // -- Inspect radio button
+            ImGui::TableSetColumnIndex(0);
+            {
+                const bool selected = (ctx.InspectedChannelId == ch.Id);
+                if (ImGui::RadioButton("##insp", selected) && !selected) {
+                    ctx.InspectedChannelId = ch.Id;
+                    ctx.FetchAtPlayhead();
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Inspect this channel in the Message Inspector");
+            }
 
             // -- Colour swatch
-            ImGui::TableSetColumnIndex(0);
+            ImGui::TableSetColumnIndex(1);
             if (uis) {
                 ImGui::ColorButton("##col", ImVec4(uis->Color[0], uis->Color[1],
                                                    uis->Color[2], uis->Color[3]),
@@ -81,27 +95,27 @@ void ChannelListPanel::Draw(AppContext& ctx)
             }
 
             // -- Visibility toggle
-            ImGui::TableSetColumnIndex(1);
+            ImGui::TableSetColumnIndex(2);
             if (uis) {
-                ImGui::PushID(i);
                 ImGui::Checkbox("##vis", &uis->Visible);
-                ImGui::PopID();
             }
 
+            ImGui::PopID();
+
             // -- Name
-            ImGui::TableSetColumnIndex(2);
+            ImGui::TableSetColumnIndex(3);
             ImGui::TextUnformatted(ch.Name.c_str());
 
             // -- Layer
-            ImGui::TableSetColumnIndex(3);
+            ImGui::TableSetColumnIndex(4);
             ImGui::TextUnformatted(LayerName(ch.Layer));
 
             // -- Codec
-            ImGui::TableSetColumnIndex(4);
+            ImGui::TableSetColumnIndex(5);
             ImGui::TextUnformatted(CompressionName(ch.Compression));
 
             // -- Schema
-            ImGui::TableSetColumnIndex(5);
+            ImGui::TableSetColumnIndex(6);
             ImGui::TextDisabled("%s", ch.Schema.empty() ? "(none)" : ch.Schema.c_str());
         }
 

@@ -71,6 +71,9 @@ set(VIEWER_SOURCES
     SessionLoader.cpp
     util/FormatUtil.hpp
     util/HexView.hpp
+    util/SchemaInspector.hpp
+    util/VideoTexture.hpp
+    util/VideoTexture.cpp
     panels/IPanel.hpp
     panels/SessionInfoPanel.hpp
     panels/SessionInfoPanel.cpp

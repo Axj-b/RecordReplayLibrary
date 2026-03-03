@@ -61,7 +61,8 @@ void SessionLoader::Close(AppContext& ctx)
     ctx.Manifest      = {};
     ctx.SessionPath.clear();
     ctx.ChannelStates.clear();
-    ctx.PlayheadNs = 0;
+    ctx.PlayheadNs        = 0;
+    ctx.InspectedChannelId = recplay::INVALID_CHANNEL_ID;
     ctx.SelectedMessage.reset();
 }
 

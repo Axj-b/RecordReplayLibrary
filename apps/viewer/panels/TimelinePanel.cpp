@@ -157,18 +157,7 @@ void TimelinePanel::Draw(AppContext& ctx)
 
 void TimelinePanel::FetchMessageAtPlayhead(AppContext& ctx)
 {
-    if (!ctx.HasSession()) return;
-
-    recplay::MessageView msg;
-    ctx.Reader->Seek(ctx.PlayheadNs);
-    if (ctx.Reader->ReadNext(msg) && msg.IsValid()) {
-        CachedMessage cm;
-        cm.Channel     = msg.Channel;
-        cm.TimestampNs = msg.TimestampNs;
-        cm.Payload.assign(static_cast<const uint8_t*>(msg.Data),
-                          static_cast<const uint8_t*>(msg.Data) + msg.Length);
-        ctx.SelectedMessage = std::move(cm);
-    }
+    ctx.FetchAtPlayhead();
 }
 
 } // namespace viewer::panels

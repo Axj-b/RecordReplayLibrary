@@ -114,6 +114,17 @@ struct SessionConfig {
     /// Index granularity: write one IndexEntry per channel approx every N nanoseconds
     /// (used by the reader for binary-search seeking). Default: 1 second.
     uint64_t IndexIntervalNs = 1'000'000'000ull;
+
+    /// When true, the recorder writes a single flat .rec file instead of a
+    /// session sub-directory containing multiple segment files and a separate
+    /// session.manifest.  The output file is placed directly in OutputDir:
+    ///
+    ///   OutputDir / SessionName.rec   (e.g.  /recordings/my_capture.rec)
+    ///
+    /// Segment rotation is disabled in this mode.  All session metadata
+    /// (channel definitions, timestamps) is embedded in the .rec file itself
+    /// and the file can be opened directly by ReaderSession::Open().
+    bool SingleFile = false;
 };
 
 }  // namespace recplay

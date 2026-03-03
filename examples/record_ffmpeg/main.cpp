@@ -126,6 +126,7 @@ int main(int argc, char* argv[])
     cfg.OutputDir   = output_dir;
     cfg.SessionName = "ffmpeg_testsrc";
     cfg.CrcEnabled  = true;
+    cfg.SingleFile  = true;
 
     if (auto s = session.Open(cfg); s != recplay::Status::Ok) {
         std::cerr << "Failed to open session (status " << static_cast<int>(s) << ")\n";
@@ -184,15 +185,16 @@ int main(int argc, char* argv[])
     // 4. Capture loop
     // -----------------------------------------------------------------------
 
-    const uint64_t frame_ns  = 1'000'000'000ull / VIDEO_FPS; // nanoseconds per frame
-    recplay::Timestamp ts    = now_ns();
-
     std::vector<uint8_t> video_buf(FRAME_BYTES);
     std::vector<uint8_t> audio_buf(AUDIO_CHUNK_BYTES);
 
-    int frames_captured = 0;
+    int                frames_captured = 0;
+    recplay::Timestamp last_ts         = now_ns();
 
     while (frames_captured < frame_count) {
+        // Timestamp the frame at the moment it is received from FFmpeg.
+        const recplay::Timestamp ts = now_ns();
+
         // Read one video frame
         if (!read_exact(vid_pipe, video_buf.data(), FRAME_BYTES)) {
             std::cout << "Video pipe ended after " << frames_captured << " frames.\n";
@@ -207,7 +209,7 @@ int main(int argc, char* argv[])
         if (has_audio)
             session.Write(aud_ch, ts, audio_buf.data(), static_cast<uint32_t>(AUDIO_CHUNK_BYTES));
 
-        ts += frame_ns;
+        last_ts = ts;
         ++frames_captured;
 
         if (frames_captured % VIDEO_FPS == 0)
@@ -222,12 +224,18 @@ int main(int argc, char* argv[])
     PCLOSE(vid_pipe);
     PCLOSE(aud_pipe);
 
-    session.Annotate(ts, "recording_end");
+    // Annotation timestamp matches the last captured frame exactly.
+    session.Annotate(last_ts, "recording_end");
+
+    const std::string sessPath      = session.SessionPath();
+    const uint64_t    vidFrames     = session.MessagesWritten(vid_ch);
+    const uint64_t    audChunks     = session.MessagesWritten(aud_ch);
+
     session.Close();
 
-    std::cout << "Done. Session path: " << session.SessionPath() << "\n"
-              << "  video frames : " << session.MessagesWritten(vid_ch) << "\n"
-              << "  audio chunks : " << session.MessagesWritten(aud_ch) << "\n";
+    std::cout << "Done. Session path: " << sessPath << "\n"
+              << "  video frames : " << vidFrames  << "\n"
+              << "  audio chunks : " << audChunks  << "\n";
 
     return 0;
 }

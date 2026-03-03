@@ -56,8 +56,10 @@ static SessionId GenerateUuidV4() {
 struct WriterImpl {
     SessionConfig   Cfg;
     SessionManifest Mfst;
-    std::string     Dir;          ///< Full session directory path
+    std::string     Dir;          ///< Session directory (or output dir in SingleFile mode)
     std::string     SegBaseName;  ///< Base name for segment files (= session dir leaf name)
+    std::string     FilePath;     ///< SingleFile mode: full path to the .rec file
+    bool            SingleFile  = false; ///< Mirrors Cfg.SingleFile for convenience
 
     MappedFile      SegFile;
     uint32_t        SegIdx      = 0;
@@ -397,26 +399,59 @@ Status RecorderSession::Open(const SessionConfig& config) {
     impl->Mfst.CreatedAtNs     = detail::NowNs();
     impl->Mfst.RecorderVersion = VersionString();
 
-    // --- Session directory ---
-    const std::string subDir = config.SessionName.empty()
-        ? detail::MakeSessionDirName(impl->Mfst)
-        : config.SessionName;
-    impl->Dir         = config.OutputDir + static_cast<char>(detail::PATH_SEP) + subDir;
-    impl->SegBaseName = subDir;
+    impl->SingleFile = config.SingleFile;
 
-    try {
-        fs::create_directories(impl->Dir);
-    } catch (...) {
-        return Status::ErrorIO;
+    if (config.SingleFile) {
+        // ----- Single-file mode -----
+        // Output goes directly to:  OutputDir / SessionName.rec
+        // No sub-directory, no session.manifest sidecar.
+        const std::string baseName =
+            config.SessionName.empty() ? "recording" : config.SessionName;
+
+        try {
+            fs::create_directories(config.OutputDir);
+        } catch (...) {
+            return Status::ErrorIO;
+        }
+
+        impl->Dir         = config.OutputDir;
+        impl->SegBaseName = baseName;
+        impl->FilePath    = config.OutputDir
+                            + static_cast<char>(detail::PATH_SEP)
+                            + baseName + ".rec";
+
+        // Disable rotation: single-file sessions write everything to one file.
+        impl->Cfg.MaxSegmentBytes      = 0;
+        impl->Cfg.MaxSegmentDurationNs = 0;
+
+        impl->SegFile = detail::MappedFile::OpenWrite(impl->FilePath);
+        if (!impl->SegFile.IsOpen()) return Status::ErrorIO;
+
+        Status st = impl->WriteFileHeader();
+        if (st != Status::Ok) return st;
+        st = impl->WriteSessionStartRecord();
+        if (st != Status::Ok) return st;
+
+    } else {
+        // ----- Directory (multi-segment) mode -----
+        const std::string subDir = config.SessionName.empty()
+            ? detail::MakeSessionDirName(impl->Mfst)
+            : config.SessionName;
+        impl->Dir         = config.OutputDir + static_cast<char>(detail::PATH_SEP) + subDir;
+        impl->SegBaseName = subDir;
+
+        try {
+            fs::create_directories(impl->Dir);
+        } catch (...) {
+            return Status::ErrorIO;
+        }
+
+        Status st = impl->OpenSegment(0);
+        if (st != Status::Ok) return st;
+
+        st = detail::WriteManifest(impl->Dir, impl->Mfst);
+        if (st != Status::Ok) return st;
     }
-
-    // --- Open first segment ---
-    Status st = impl->OpenSegment(0);
-    if (st != Status::Ok) return st;
-
-    // --- Write initial manifest ---
-    st = detail::WriteManifest(impl->Dir, impl->Mfst);
-    if (st != Status::Ok) return st;
 
     m_Impl = std::move(impl);
     return Status::Ok;
@@ -426,7 +461,8 @@ Status RecorderSession::Close() {
     if (!m_Impl) return Status::Ok;
 
     Status st = m_Impl->CloseSegment();
-    detail::WriteManifest(m_Impl->Dir, m_Impl->Mfst); // best-effort
+    if (!m_Impl->SingleFile)
+        detail::WriteManifest(m_Impl->Dir, m_Impl->Mfst); // best-effort
     m_Impl.reset();
     return st;
 }
@@ -573,6 +609,12 @@ Status RecorderSession::Annotate(Timestamp          timestampNs,
                                  uint32_t           metadataLength) {
     if (!m_Impl) return Status::ErrorNotOpen;
 
+    // Flush all chunk accumulators first so that data written before this
+    // annotation appears before it in the file (accumulators buffer writes
+    // and would otherwise be flushed later during CloseSegment).
+    for (auto& acc : m_Impl->Accums)
+        if (acc) acc->Flush();
+
     // ANNOTATION payload: [label_len:uint16_t][label][metadata_len:uint32_t][metadata]
     const auto labelLen = static_cast<uint16_t>(label.size());
     std::vector<uint8_t> buf;
@@ -610,6 +652,8 @@ Status RecorderSession::Flush() {
 
 Status RecorderSession::RotateSegment() {
     if (!m_Impl) return Status::ErrorNotOpen;
+    if (m_Impl->SingleFile) return Status::ErrorInvalidArg; // rotation not supported in single-file mode
+
     Status st = m_Impl->CloseSegment();
     if (st != Status::Ok) return st;
 
@@ -648,7 +692,8 @@ const std::string& RecorderSession::SessionPath() const noexcept {
         static const std::string empty;
         return empty;
     }
-    return m_Impl->Dir;
+    // In single-file mode return the .rec file path; otherwise the session directory.
+    return m_Impl->SingleFile ? m_Impl->FilePath : m_Impl->Dir;
 }
 
 } // namespace recplay

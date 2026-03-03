@@ -66,8 +66,47 @@ struct AppContext {
     /// Current playhead position in the timeline (nanoseconds, absolute).
     recplay::Timestamp PlayheadNs = 0;
 
+    /// Channel to show in the inspector.
+    /// INVALID_CHANNEL_ID = "any channel" (returns the first message found at
+    /// PlayheadNs regardless of channel).
+    recplay::ChannelId InspectedChannelId = recplay::INVALID_CHANNEL_ID;
+
     /// Message currently selected / shown in the inspector.
     std::optional<CachedMessage> SelectedMessage;
+
+    /// Seek to PlayheadNs and fetch the first message for InspectedChannelId
+    /// (or any channel when InspectedChannelId == INVALID_CHANNEL_ID).
+    /// Stores the result in SelectedMessage.
+    void FetchAtPlayhead()
+    {
+        if (!HasSession()) return;
+        if (InspectedChannelId != recplay::INVALID_CHANNEL_ID) {
+            // Use filtered read so we get the right channel even in a mixed file.
+            recplay::ReadOptions opts;
+            opts.ChannelFilter = { InspectedChannelId };
+            opts.StartNs       = PlayheadNs;
+            Reader->Read(opts, [this](const recplay::MessageView& mv) -> bool {
+                CachedMessage cm;
+                cm.Channel     = mv.Channel;
+                cm.TimestampNs = mv.TimestampNs;
+                cm.Payload.assign(static_cast<const uint8_t*>(mv.Data),
+                                  static_cast<const uint8_t*>(mv.Data) + mv.Length);
+                SelectedMessage = std::move(cm);
+                return false; // stop after the first match
+            });
+        } else {
+            recplay::MessageView mv;
+            Reader->Seek(PlayheadNs);
+            if (Reader->ReadNext(mv) && mv.IsValid()) {
+                CachedMessage cm;
+                cm.Channel     = mv.Channel;
+                cm.TimestampNs = mv.TimestampNs;
+                cm.Payload.assign(static_cast<const uint8_t*>(mv.Data),
+                                  static_cast<const uint8_t*>(mv.Data) + mv.Length);
+                SelectedMessage = std::move(cm);
+            }
+        }
+    }
 
     // ------------------------------------------------------------------
     // UI flags

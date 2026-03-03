@@ -1,2 +1,3 @@
 add_subdirectory(record_ffmpeg)
+add_subdirectory(record_multi_pattern)
 add_subdirectory(replay_ffplay)

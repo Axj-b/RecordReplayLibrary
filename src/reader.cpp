@@ -20,6 +20,7 @@
 // system includes
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 
@@ -102,7 +103,52 @@ struct ReaderImpl {
     }
 
     // ------------------------------------------------------------------
-    // At-open scan: load index + collect annotations from one segment
+    // Helper: parse a CHANNEL_DEF record payload into a ChannelDef.
+    // Mirror of WriterImpl::WriteChannelDefRecord's binary layout.
+    // ------------------------------------------------------------------
+
+    static ChannelDef ParseChannelDefPayload(const uint8_t* p, uint32_t len)
+    {
+        ChannelDef ch{};
+        uint32_t pos = 0;
+
+        auto rd16 = [&]() -> uint16_t {
+            if (pos + 2 > len) return 0;
+            uint16_t v{}; std::memcpy(&v, p + pos, 2); pos += 2;
+            return Le16ToHost(v);
+        };
+        auto rd32 = [&]() -> uint32_t {
+            if (pos + 4 > len) return 0;
+            uint32_t v{}; std::memcpy(&v, p + pos, 4); pos += 4;
+            return Le32ToHost(v);
+        };
+        auto rdStr16 = [&]() -> std::string {
+            const uint16_t l = rd16();
+            if (pos + l > len) return {};
+            std::string s(reinterpret_cast<const char*>(p + pos), l);
+            pos += l;
+            return s;
+        };
+
+        ch.Id                   = rd16();
+        if (pos >= len) return ch;
+        ch.Layer                = static_cast<CaptureLayer>(p[pos++]);
+        if (pos >= len) return ch;
+        ch.Compression          = static_cast<CompressionCodec>(p[pos++]);
+        ch.ChunkSizeBytes       = rd32();
+        ch.ChunkFlushIntervalMs = rd32();
+        ch.Name                 = rdStr16();
+        ch.Schema               = rdStr16();
+        const uint32_t metaLen  = rd32();
+        if (pos + metaLen <= len)
+            ch.UserMetadata.assign(p + pos, p + pos + metaLen);
+        return ch;
+    }
+
+    // ------------------------------------------------------------------
+    // At-open scan: load index, collect annotations, and (when Mfst has
+    // no channels yet) parse SessionStart + ChannelDef records so that
+    // a standalone .rec file can be opened without a session.manifest.
     // ------------------------------------------------------------------
 
     void ScanSegmentAtOpen(SegmentData& seg) {
@@ -132,6 +178,32 @@ struct ReaderImpl {
             const auto     op      = static_cast<RecordOp>(env->Op);
 
             switch (op) {
+                case RecordOp::SessionStart: {
+                    // Extract recorder_version from the small JSON blob when
+                    // we are reconstructing the manifest from the file itself.
+                    if (Mfst.RecorderVersion.empty() && payloadLen > 0) {
+                        const std::string json(
+                            reinterpret_cast<const char*>(payload), payloadLen);
+                        const std::string key = "\"recorder_version\":\"";
+                        const size_t      kp  = json.find(key);
+                        if (kp != std::string::npos) {
+                            const size_t vs = kp + key.size();
+                            const size_t ve = json.find('"', vs);
+                            if (ve != std::string::npos)
+                                Mfst.RecorderVersion = json.substr(vs, ve - vs);
+                        }
+                    }
+                    break;
+                }
+                case RecordOp::ChannelDef: {
+                    // Parse and register the channel if not yet known.
+                    // This makes the reader self-sufficient for single .rec files
+                    // that carry no external session.manifest.
+                    ChannelDef ch = ParseChannelDefPayload(payload, payloadLen);
+                    if (!ch.Name.empty() && Mfst.FindChannel(ch.Id) == nullptr)
+                        Mfst.Channels.push_back(std::move(ch));
+                    break;
+                }
                 case RecordOp::Data: {
                     const ChannelId ch = Le16ToHost(env->Channel);
                     if (ts < seg.StartNs) seg.StartNs = ts;
@@ -367,24 +439,76 @@ Status ReaderSession::Open(const std::string& sessionPath) {
     auto impl = std::make_unique<detail::ReaderImpl>();
     impl->Path = sessionPath;
 
-    Status st = detail::ReadManifest(sessionPath, impl->Mfst);
-    if (st != Status::Ok) return st;
+    // ----------------------------------------------------------------
+    // Auto-detect: if sessionPath points directly to a .rec file
+    // (identified by the 8-byte magic), open it in single-file mode
+    // and reconstruct the manifest from the embedded records.
+    // Otherwise fall back to the original directory + session.manifest
+    // approach for multi-segment sessions.
+    // ----------------------------------------------------------------
+    bool isSingleFile = false;
+    {
+        uint8_t magic[8]{};
+        FILE* f = nullptr;
+#if RECPLAY_PLATFORM_WINDOWS
+        fopen_s(&f, sessionPath.c_str(), "rb");
+#else
+        f = std::fopen(sessionPath.c_str(), "rb");
+#endif
+        if (f) {
+            isSingleFile = (std::fread(magic, 1, 8, f) == 8 &&
+                            std::memcmp(magic, format::MAGIC, 8) == 0);
+            std::fclose(f);
+        }
+    }
 
-    // Map all segment files
-    for (const auto& segInfo : impl->Mfst.Segments) {
-        const std::string filepath =
-            sessionPath + static_cast<char>(detail::PATH_SEP) + segInfo.Filename;
-
+    if (isSingleFile) {
+        // ---- Single .rec file: reconstruct manifest by scanning the file ----
         detail::SegmentData sd;
-        sd.File = detail::MappedFile::OpenRead(filepath);
-        if (!sd.File.IsOpen()) continue; // non-fatal: log but keep going
+        sd.File = detail::MappedFile::OpenRead(sessionPath);
+        if (!sd.File.IsOpen()) return Status::ErrorNotFound;
 
+        // Extract session identity from the FileHeader.
+        if (sd.File.FileSize() >= sizeof(format::FileHeader)) {
+            const auto* hdr =
+                reinterpret_cast<const format::FileHeader*>(sd.File.Data());
+            std::memcpy(impl->Mfst.Id.data(), hdr->SessionId, 16);
+            impl->Mfst.CreatedAtNs = detail::Le64ToHost(hdr->CreatedAtNs);
+        }
+
+        // ScanSegmentAtOpen parses ChannelDef + SessionStart into impl->Mfst
+        // and fills sd.StartNs / sd.EndNs from the data records.
         impl->ScanSegmentAtOpen(sd);
-        // Override with manifest info if the scan found nothing
-        if (sd.StartNs == 0) sd.StartNs = segInfo.StartNs;
-        if (sd.EndNs   == 0) sd.EndNs   = segInfo.EndNs;
 
+        SegmentInfo si{};
+        si.Filename     = sessionPath;  // full path for display
+        si.SegmentIndex = 0;
+        si.StartNs      = sd.StartNs;
+        si.EndNs        = sd.EndNs;
+        si.SizeBytes    = sd.File.FileSize();
+        impl->Mfst.Segments.push_back(std::move(si));
         impl->Segs.push_back(std::move(sd));
+
+    } else {
+        // ---- Directory mode: read session.manifest then open each segment ----
+        Status st = detail::ReadManifest(sessionPath, impl->Mfst);
+        if (st != Status::Ok) return st;
+
+        for (const auto& segInfo : impl->Mfst.Segments) {
+            const std::string filepath =
+                sessionPath + static_cast<char>(detail::PATH_SEP) + segInfo.Filename;
+
+            detail::SegmentData sd;
+            sd.File = detail::MappedFile::OpenRead(filepath);
+            if (!sd.File.IsOpen()) continue; // non-fatal: keep going
+
+            impl->ScanSegmentAtOpen(sd);
+            // Fall back to manifest info if scan found nothing
+            if (sd.StartNs == 0) sd.StartNs = segInfo.StartNs;
+            if (sd.EndNs   == 0) sd.EndNs   = segInfo.EndNs;
+
+            impl->Segs.push_back(std::move(sd));
+        }
     }
 
     impl->CurSeg    = 0;

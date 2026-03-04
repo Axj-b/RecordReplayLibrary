@@ -11,6 +11,7 @@ A C++17 recording/replay library for timestamped channel data (video, audio, tel
 - Example apps:
   - `record_ffmpeg` (record FFmpeg video/audio test streams)
   - `record_multi_pattern` (record 4 video patterns in parallel)
+  - `record_net_streams` (record multiple UDP/TCP payload streams + PEAK CAN stub)
   - `replay_ffplay` (pipe recorded video to FFplay)
   - `viewer` (inspect channels/messages/timeline)
 
@@ -51,6 +52,18 @@ With current example config, output is a single file:
 ```
 
 Open a `.rec` file directly from the UI.
+
+### 4) Record UDP/TCP streams (and optional CAN stub)
+
+```powershell
+& "C:\develop\RecordReplayLibrary\build\bin\Debug\record_net_streams.exe" "C:\develop\RecordReplayLibrary\build\recordings" --session net_capture --udp 5000 --tcp 127.0.0.1:9000 --can-peak PCAN_USBBUS1 --duration 10
+```
+
+Notes:
+
+- `record_net_streams` records payload bytes into separate channels per source.
+- `--udp` and `--tcp` are repeatable for multiple streams.
+- `--can-peak` is currently a stub hook (for future PEAK integration).
 
 ## Single-file vs Directory Sessions
 

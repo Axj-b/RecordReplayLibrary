@@ -10,9 +10,11 @@
 #include <sstream>
 #include <iomanip>
 #include <stdexcept>
+#include <filesystem>
 
 namespace recplay {
 namespace detail {
+namespace fs = std::filesystem;
 
 // ---------------------------------------------------------------------------
 // Internal JSON helpers
@@ -169,7 +171,8 @@ static std::vector<std::string> ExtractJsonObjects(const std::string& json, cons
 // ---------------------------------------------------------------------------
 
 Status WriteManifest(const std::string& sessionDir, const SessionManifest& manifest) {
-    std::string path = sessionDir + static_cast<char>(PATH_SEP) + "session.manifest";
+    const std::string path    = sessionDir + static_cast<char>(PATH_SEP) + "session.manifest";
+    const std::string tmpPath = path + ".tmp";
 
     std::ostringstream oss;
     oss << "{\n";
@@ -212,15 +215,34 @@ Status WriteManifest(const std::string& sessionDir, const SessionManifest& manif
 
     FILE* f = nullptr;
 #if RECPLAY_PLATFORM_WINDOWS
-    if (fopen_s(&f, path.c_str(), "wb") != 0) f = nullptr;
+    if (fopen_s(&f, tmpPath.c_str(), "wb") != 0) f = nullptr;
 #else
-    f = std::fopen(path.c_str(), "wb");
+    f = std::fopen(tmpPath.c_str(), "wb");
 #endif
     if (!f) return Status::ErrorIO;
 
     bool ok = (std::fwrite(payload.data(), 1, payload.size(), f) == payload.size());
     std::fclose(f);
-    return ok ? Status::Ok : Status::ErrorIO;
+    if (!ok) {
+        fs::remove(tmpPath);
+        return Status::ErrorIO;
+    }
+
+    // Prefer rename for an atomic replace on platforms/filesystems that support it.
+    // Fall back to copy+overwrite when rename over an existing file fails (e.g. Windows).
+    try {
+        fs::rename(tmpPath, path);
+        return Status::Ok;
+    } catch (...) {
+        try {
+            fs::copy_file(tmpPath, path, fs::copy_options::overwrite_existing);
+            fs::remove(tmpPath);
+            return Status::Ok;
+        } catch (...) {
+            fs::remove(tmpPath);
+            return Status::ErrorIO;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

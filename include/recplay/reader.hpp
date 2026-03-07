@@ -97,6 +97,10 @@ using ReadCallback = std::function<bool(const MessageView&)>;
 ///       process(msg);
 ///   }
 /// @endcode
+///
+/// Thread-safety:
+/// - Not thread-safe for concurrent calls on the same instance.
+/// - External synchronisation is required when multiple threads share one ReaderSession.
 class RECPLAY_API ReaderSession final {
 public:
     ReaderSession() noexcept;

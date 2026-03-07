@@ -125,6 +125,10 @@ struct MergeResult {
 ///
 /// Neither operation re-compresses or re-encodes payloads; chunk boundaries
 /// from the source session(s) are preserved where possible.
+///
+/// Thread-safety:
+/// - Static operations do not share mutable global state.
+/// - Concurrent calls are safe as long as they do not target the same output paths.
 class RECPLAY_API Splitter final {
 public:
 

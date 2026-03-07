@@ -38,6 +38,21 @@ struct SegmentData {
     uint64_t    EndNs   = 0;
 };
 
+static Status ValidateFileHeader(const uint8_t* base, uint64_t size) {
+    if (!base || size < sizeof(format::FileHeader))
+        return Status::ErrorCorrupted;
+
+    const auto* hdr = reinterpret_cast<const format::FileHeader*>(base);
+    if (std::memcmp(hdr->Magic, format::MAGIC, 8) != 0)
+        return Status::ErrorCorrupted;
+
+    // Compatibility contract: major version must match exactly.
+    if (hdr->VersionMajor != format::VERSION_MAJOR)
+        return Status::ErrorCorrupted;
+
+    return Status::Ok;
+}
+
 // ---------------------------------------------------------------------------
 // ReaderImpl
 // ---------------------------------------------------------------------------
@@ -461,6 +476,9 @@ Status ReaderSession::Open(const std::string& sessionPath) {
         sd.File = detail::MappedFile::OpenRead(sessionPath);
         if (!sd.File.IsOpen()) return Status::ErrorNotFound;
 
+        Status st = detail::ValidateFileHeader(sd.File.Data(), sd.File.FileSize());
+        if (st != Status::Ok) return st;
+
         // Extract session identity from the FileHeader.
         if (sd.File.FileSize() >= sizeof(format::FileHeader)) {
             const auto* hdr =
@@ -494,6 +512,9 @@ Status ReaderSession::Open(const std::string& sessionPath) {
             detail::SegmentData sd;
             sd.File = detail::MappedFile::OpenRead(filepath);
             if (!sd.File.IsOpen()) continue; // non-fatal: keep going
+
+            st = detail::ValidateFileHeader(sd.File.Data(), sd.File.FileSize());
+            if (st != Status::Ok) return st;
 
             impl->ScanSegmentAtOpen(sd);
             // Fall back to manifest info if scan found nothing

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <tuple>
 #include <vector>
 
 using namespace recplay;
@@ -190,5 +191,55 @@ TEST_F(RoundtripTest, MuxSplitMergeRoundtrip) {
     auto valSt = Splitter::Validate(mr.SessionPath, &corrupt);
     EXPECT_EQ(valSt, Status::Ok);
     EXPECT_EQ(corrupt, 0u);
+}
+
+TEST_F(RoundtripTest, MergeEqualTimestampsIsDeterministicBySourceOrder) {
+    const std::string srcADir = dir_ + "/srcA";
+    const std::string srcBDir = dir_ + "/srcB";
+    const std::string outDir  = dir_ + "/merged_eq_ts";
+    fs::create_directories(outDir);
+
+    auto createSession = [](const std::string& outRoot,
+                            const std::string& channelName,
+                            const std::vector<std::pair<Timestamp, uint8_t>>& samples) {
+        SessionConfig cfg;
+        cfg.OutputDir = outRoot;
+
+        RecorderSession w;
+        EXPECT_EQ(w.Open(cfg), Status::Ok);
+        ChannelId ch = w.DefineChannel({channelName, CaptureLayer::L7, CompressionCodec::None});
+        EXPECT_NE(ch, INVALID_CHANNEL_ID);
+        for (const auto& s : samples)
+            EXPECT_EQ(w.Write(ch, s.first, &s.second, 1), Status::Ok);
+        const std::string path = w.SessionPath();
+        EXPECT_EQ(w.Close(), Status::Ok);
+        return path;
+    };
+
+    const std::string sessA = createSession(srcADir, "A", {{100, 1}, {200, 3}, {300, 5}});
+    const std::string sessB = createSession(srcBDir, "B", {{100, 2}, {200, 4}, {300, 6}});
+
+    MergeResult mr;
+    ASSERT_EQ(Splitter::Merge({sessA, sessB}, outDir, mr), Status::Ok);
+
+    ReaderSession reader;
+    ASSERT_EQ(reader.Open(mr.SessionPath), Status::Ok);
+
+    std::vector<std::pair<std::string, uint8_t>> got;
+    MessageView msg;
+    while (reader.ReadNext(msg)) {
+        const ChannelDef* def = reader.FindChannel(msg.Channel);
+        ASSERT_NE(def, nullptr);
+        ASSERT_EQ(msg.Length, 1u);
+        got.push_back({def->Name, static_cast<const uint8_t*>(msg.Data)[0]});
+    }
+
+    const std::vector<std::pair<std::string, uint8_t>> expected = {
+        {"A", 1}, {"B", 2},
+        {"A", 3}, {"B", 4},
+        {"A", 5}, {"B", 6},
+    };
+    EXPECT_EQ(got, expected);
+    EXPECT_EQ(reader.Close(), Status::Ok);
 }
 

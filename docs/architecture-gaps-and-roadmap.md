@@ -2,6 +2,17 @@
 
 This document captures important architecture decisions that are often missed in v1 systems and proposes concrete defaults for `RecordReplayLibrary`.
 
+## Implementation Status (Current)
+
+- [x] Reader rejects unsupported major format versions.
+- [x] Public thread-safety contract notes added to `RecorderSession`, `ReaderSession`, and `Splitter`.
+- [x] Deterministic merge ordering for equal timestamps is regression-tested.
+- [x] Manifest writes now use temp-file replace with rename-first/copy-overwrite fallback.
+- [ ] Compatibility golden-file matrix across historical versions.
+- [ ] Crash-injection durability tests and stronger fsync mode.
+- [ ] Fuzzing targets and parser hard limits.
+- [ ] Structured diagnostics callback and benchmark harness.
+
 ## 1. Compatibility Policy
 
 Current gap:

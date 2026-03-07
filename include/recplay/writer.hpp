@@ -42,6 +42,10 @@ namespace recplay {
     ///
     ///   rec.Close();
     /// @endcode
+    ///
+    /// Thread-safety:
+    /// - Not thread-safe for concurrent calls on the same instance.
+    /// - External synchronisation is required when multiple threads share one RecorderSession.
     class RECPLAY_API RecorderSession final {
         public:
             RecorderSession() noexcept;

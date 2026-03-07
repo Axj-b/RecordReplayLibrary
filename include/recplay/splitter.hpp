@@ -40,13 +40,16 @@ struct SplitOptions {
     /// If non-empty, only the listed channel IDs are extracted.
     std::vector<ChannelId> ChannelIds;
 
-    /// If true, each channel is written to its own named sub-directory under output dir.
-    /// If false, all selected channels are written to one session per channel in output dir.
+    /// If true, each channel output is placed under:
+    ///   outputDir / sanitised_channel_name / session_name
+    /// If false, sessions are created directly under outputDir.
     /// Default: true.
     bool OneDirPerChannel = true;
 
     /// Optional naming pattern for output session directories.
-    /// The placeholder {channel_name} is replaced with the channel's name (slashes → underscores).
+    /// Supported placeholders:
+    ///   {channel_name}          -> sanitised channel name (slashes -> underscores)
+    ///   {original_session_name} -> source session directory name
     /// Default: "{original_session_name}_{channel_name}".
     std::string OutputDirPattern;
 

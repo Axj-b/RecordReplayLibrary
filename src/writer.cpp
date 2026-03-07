@@ -71,11 +71,14 @@ struct WriterImpl {
 
     /// Timestamp of the first record pushed to each accumulator since last flush.
     std::vector<Timestamp>  AccumFirstTs;
+    /// Timestamp of the latest record pushed to each accumulator since last flush.
+    std::vector<Timestamp>  AccumLastTs;
     std::vector<bool>       AccumHasData;
 
     uint64_t RecordCount = 0;  ///< Records written to the current segment
     uint64_t SegStartNs  = 0;  ///< Timestamp of the first DATA record in this segment
     uint64_t SegLastNs   = 0;  ///< Timestamp of the most recent DATA record
+    bool     SegHasData  = false;
 
     std::vector<uint64_t> MsgWritten;  ///< Per-channel written count (across all segments)
     std::vector<uint64_t> MsgDropped;  ///< Per-channel drop count
@@ -90,6 +93,9 @@ struct WriterImpl {
 
     Status WriteRecord(RecordOp op, ChannelId ch, Timestamp ts,
                        const void* data, uint32_t len) {
+        if (len > 0 && data == nullptr)
+            return Status::ErrorInvalidArg;
+
         // Assemble envelope in LE byte order
         format::RecordEnvelope env{};
         env.Op            = static_cast<uint8_t>(op);
@@ -104,7 +110,7 @@ struct WriterImpl {
                           "RecordEnvelope CRC field must be at offset 16");
             env.Flags |= static_cast<uint8_t>(RECORD_FLAG_CRC); // set flag BEFORE computing CRC
             uint32_t crc = Crc32(reinterpret_cast<const uint8_t*>(&env), 16);
-            if (data && len)
+            if (len)
                 crc = Crc32(reinterpret_cast<const uint8_t*>(data), len, crc);
             env.Crc32 = HostToLe32(crc);
         }
@@ -116,7 +122,7 @@ struct WriterImpl {
         std::memcpy(SegFile.WritePtr(), &env, sizeof(env));
         SegFile.Advance(sizeof(env));
 
-        if (data && len) {
+        if (len) {
             std::memcpy(SegFile.WritePtr(), data, len);
             SegFile.Advance(len);
         }
@@ -129,6 +135,9 @@ struct WriterImpl {
     Status WriteChunkRecord(ChannelId ch, Timestamp firstTs,
                             CompressionCodec codec, uint32_t uncompBytes, uint32_t recCount,
                             const void* compData, uint32_t compLen) {
+        if (compLen > 0 && compData == nullptr)
+            return Status::ErrorInvalidArg;
+
         // Build ChunkHeader in LE
         format::ChunkHeader chdr{};
         chdr.Codec               = static_cast<uint8_t>(codec);
@@ -158,7 +167,7 @@ struct WriterImpl {
             env.Flags |= static_cast<uint8_t>(RECORD_FLAG_CRC); // flag set before CRC computation
             uint32_t crc = Crc32(reinterpret_cast<const uint8_t*>(&env), 16);
             crc = Crc32(reinterpret_cast<const uint8_t*>(&chdr), sizeof(chdr), crc);
-            if (compData && compLen)
+            if (compLen)
                 crc = Crc32(reinterpret_cast<const uint8_t*>(compData), compLen, crc);
             env.Crc32 = HostToLe32(crc);
         }
@@ -167,7 +176,7 @@ struct WriterImpl {
         SegFile.Advance(sizeof(env));
         std::memcpy(SegFile.WritePtr(), &chdr, sizeof(chdr));
         SegFile.Advance(sizeof(chdr));
-        if (compData && compLen) {
+        if (compLen) {
             std::memcpy(SegFile.WritePtr(), compData, compLen);
             SegFile.Advance(compLen);
         }
@@ -254,11 +263,49 @@ struct WriterImpl {
                            buf.data(), static_cast<uint32_t>(buf.size()));
     }
 
+    void NoteDataRange(Timestamp firstTs, Timestamp lastTs) {
+        if (!SegHasData) {
+            SegStartNs = firstTs;
+            SegLastNs  = lastTs;
+            SegHasData = true;
+            return;
+        }
+        if (firstTs < SegStartNs) SegStartNs = firstTs;
+        if (lastTs  > SegLastNs)  SegLastNs  = lastTs;
+    }
+
+    Status FlushAccumulatorWithRotation(ChannelId ch) {
+        if (ch >= Accums.size() || !Accums[ch]) return Status::Ok;
+
+        auto& acc = Accums[ch];
+        while (true) {
+            Status st = acc->Flush();
+            if (st == Status::Ok) return Status::Ok;
+            if (st != Status::ErrorFull || SingleFile) return st;
+
+            st = CloseSegment(false);
+            if (st != Status::Ok) return st;
+
+            st = OpenSegment(SegIdx + 1);
+            if (st != Status::Ok) return st;
+        }
+    }
+
+    Status FlushAllAccumulators() {
+        for (size_t i = 0; i < Accums.size(); ++i) {
+            if (!Accums[i]) continue;
+            const Status st = FlushAccumulatorWithRotation(static_cast<ChannelId>(i));
+            if (st != Status::Ok) return st;
+        }
+        return Status::Ok;
+    }
+
     Status OpenSegment(uint32_t idx) {
         SegIdx      = idx;
         RecordCount = 0;
         SegStartNs  = 0;
         SegLastNs   = 0;
+        SegHasData  = false;
         Idx.Reset();
 
         const std::string filename = MakeSegmentFilename(SegBaseName, idx);
@@ -282,12 +329,12 @@ struct WriterImpl {
         return Status::Ok;
     }
 
-    Status CloseSegment() {
+    Status CloseSegment(bool flushAccumulators = true) {
         if (!SegFile.IsOpen()) return Status::Ok;
 
-        // Flush all accumulators
-        for (auto& acc : Accums) {
-            if (acc) acc->Flush();
+        if (flushAccumulators) {
+            const Status st = FlushAllAccumulators();
+            if (st != Status::Ok) return st;
         }
 
         // Write INDEX record
@@ -305,15 +352,16 @@ struct WriterImpl {
 
         // SESSION_END payload: [total_records:uint64_t][duration_ns:uint64_t]
         {
-            const uint64_t durationNs = (SegStartNs > 0 && SegLastNs >= SegStartNs)
+            const uint64_t durationNs = (SegHasData && SegLastNs >= SegStartNs)
                 ? (SegLastNs - SegStartNs) : 0;
             uint8_t endPayload[16]{};
             uint64_t le_rec = HostToLe64(RecordCount);
             uint64_t le_dur = HostToLe64(durationNs);
             std::memcpy(endPayload,     &le_rec, 8);
             std::memcpy(endPayload + 8, &le_dur, 8);
-            WriteRecord(RecordOp::SessionEnd, INVALID_CHANNEL_ID, SegLastNs,
-                        endPayload, sizeof(endPayload));
+            Status st = WriteRecord(RecordOp::SessionEnd, INVALID_CHANNEL_ID, SegLastNs,
+                                    endPayload, sizeof(endPayload));
+            if (st != Status::Ok) return st;
         }
 
         // File footer
@@ -372,6 +420,7 @@ struct WriterImpl {
         if (MsgDropped.size()  < need) MsgDropped.resize(need, 0);
         if (Accums.size()      < need) Accums.resize(need);
         if (AccumFirstTs.size()< need) AccumFirstTs.resize(need, 0);
+        if (AccumLastTs.size() < need) AccumLastTs.resize(need, 0);
         if (AccumHasData.size()< need) AccumHasData.resize(need, false);
     }
 };
@@ -511,11 +560,33 @@ Status RecorderSession::DefineChannel(const ChannelConfig& config, ChannelId& ou
         const auto       codec  = def.Compression;
 
         auto cb = [pImpl, chId, codec](const std::vector<uint8_t>& payload,
-                                        uint32_t uncompBytes, uint32_t recCnt) {
+                                       uint32_t uncompBytes, uint32_t recCnt) -> Status {
+            if (!pImpl->AccumHasData[chId])
+                return Status::Ok;
+
             const Timestamp firstTs = pImpl->AccumFirstTs[chId];
+            const Timestamp lastTs  = pImpl->AccumLastTs[chId];
+
+            const uint64_t estimatedSize =
+                sizeof(format::RecordEnvelope) + sizeof(format::ChunkHeader) + payload.size()
+                + sizeof(format::FileFooter)
+                + sizeof(format::RecordEnvelope) + 16   // SESSION_END
+                + sizeof(format::RecordEnvelope);       // INDEX (rough)
+
+            if (!pImpl->SingleFile && pImpl->SegHasData &&
+                pImpl->NeedsRotation(firstTs, estimatedSize)) {
+                return Status::ErrorFull;
+            }
+
+            const Status st = pImpl->WriteChunkRecord(chId, firstTs, codec, uncompBytes, recCnt,
+                                                      payload.data(),
+                                                      static_cast<uint32_t>(payload.size()));
+            if (st != Status::Ok)
+                return st;
+
             pImpl->AccumHasData[chId] = false;
-            pImpl->WriteChunkRecord(chId, firstTs, codec, uncompBytes, recCnt,
-                                    payload.data(), static_cast<uint32_t>(payload.size()));
+            pImpl->NoteDataRange(firstTs, lastTs);
+            return Status::Ok;
         };
 
         m_Impl->Accums[newId] = std::make_unique<detail::ChunkAccumulator>(
@@ -555,13 +626,10 @@ Status RecorderSession::Write(ChannelId   channelId,
                               const void* data,
                               uint32_t    length) {
     if (!m_Impl) return Status::ErrorNotOpen;
+    if (length > 0 && data == nullptr) return Status::ErrorInvalidArg;
 
     const ChannelDef* def = GetChannelDef(channelId);
     if (!def) return Status::ErrorInvalidArg;
-
-    // Update segment time window
-    if (m_Impl->SegStartNs == 0) m_Impl->SegStartNs = timestampNs;
-    if (timestampNs > m_Impl->SegLastNs) m_Impl->SegLastNs = timestampNs;
 
     if (def->Compression == CompressionCodec::None) {
         // ---- Uncompressed: write DATA record directly ----
@@ -574,9 +642,6 @@ Status RecorderSession::Write(ChannelId   channelId,
         if (m_Impl->NeedsRotation(timestampNs, estimatedSize)) {
             Status st = RotateSegment();
             if (st != Status::Ok) return st;
-            // Update timestamps in new segment
-            m_Impl->SegStartNs = timestampNs;
-            m_Impl->SegLastNs  = timestampNs;
         }
 
         const uint64_t offset = m_Impl->SegFile.BytesWritten();
@@ -584,6 +649,7 @@ Status RecorderSession::Write(ChannelId   channelId,
         if (st != Status::Ok) { ++m_Impl->MsgDropped[channelId]; return st; }
 
         m_Impl->Idx.MaybeAdd(channelId, timestampNs, offset);
+        m_Impl->NoteDataRange(timestampNs, timestampNs);
         ++m_Impl->MsgWritten[channelId];
     } else {
         // ---- Compressed: push to accumulator ----
@@ -595,8 +661,21 @@ Status RecorderSession::Write(ChannelId   channelId,
             m_Impl->AccumFirstTs[channelId]  = timestampNs;
             m_Impl->AccumHasData[channelId]  = true;
         }
+        m_Impl->AccumLastTs[channelId] = timestampNs;
 
-        acc->Push(timestampNs, data, length);
+        Status st = acc->Push(timestampNs, data, length);
+        if (st == Status::ErrorFull && !m_Impl->SingleFile) {
+            st = m_Impl->CloseSegment(false);
+            if (st == Status::Ok) {
+                detail::WriteManifest(m_Impl->Dir, m_Impl->Mfst); // best-effort mid-session update
+                st = m_Impl->OpenSegment(m_Impl->SegIdx + 1);
+            }
+            if (st == Status::Ok)
+                st = acc->Flush();
+        }
+        if (st != Status::Ok)
+            return st;
+
         ++m_Impl->MsgWritten[channelId];
     }
 
@@ -608,12 +687,16 @@ Status RecorderSession::Annotate(Timestamp          timestampNs,
                                  const void*        metadata,
                                  uint32_t           metadataLength) {
     if (!m_Impl) return Status::ErrorNotOpen;
+    if (metadataLength > 0 && metadata == nullptr) return Status::ErrorInvalidArg;
+    if (label.size() > UINT16_MAX) return Status::ErrorInvalidArg;
 
     // Flush all chunk accumulators first so that data written before this
     // annotation appears before it in the file (accumulators buffer writes
     // and would otherwise be flushed later during CloseSegment).
-    for (auto& acc : m_Impl->Accums)
-        if (acc) acc->Flush();
+    {
+        const Status st = m_Impl->FlushAllAccumulators();
+        if (st != Status::Ok) return st;
+    }
 
     // ANNOTATION payload: [label_len:uint16_t][label][metadata_len:uint32_t][metadata]
     const auto labelLen = static_cast<uint16_t>(label.size());
@@ -645,9 +728,7 @@ Status RecorderSession::Annotate(Timestamp          timestampNs,
 
 Status RecorderSession::Flush() {
     if (!m_Impl) return Status::ErrorNotOpen;
-    for (auto& acc : m_Impl->Accums)
-        if (acc) acc->Flush();
-    return Status::Ok;
+    return m_Impl->FlushAllAccumulators();
 }
 
 Status RecorderSession::RotateSegment() {
@@ -658,9 +739,6 @@ Status RecorderSession::RotateSegment() {
     if (st != Status::Ok) return st;
 
     detail::WriteManifest(m_Impl->Dir, m_Impl->Mfst); // best-effort mid-session update
-
-    // Reset accumulators' tracking state
-    std::fill(m_Impl->AccumHasData.begin(), m_Impl->AccumHasData.end(), false);
 
     return m_Impl->OpenSegment(m_Impl->SegIdx + 1);
 }

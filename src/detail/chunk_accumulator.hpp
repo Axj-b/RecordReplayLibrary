@@ -17,9 +17,10 @@ namespace detail {
 
 /// Callback invoked when a chunk is ready to be flushed to disk.
 /// Parameters: compressed payload bytes, uncompressed byte count, record count.
-using ChunkFlushCallback = std::function<void(const std::vector<uint8_t>& payload,
-                                              uint32_t uncompressedBytes,
-                                              uint32_t recordCount)>;
+/// Return Status::ErrorFull to request segment rotation and retry.
+using ChunkFlushCallback = std::function<Status(const std::vector<uint8_t>& payload,
+                                                uint32_t uncompressedBytes,
+                                                uint32_t recordCount)>;
 
 /// Accumulates raw DATA record payloads for one channel and compresses them
 /// into a CHUNK record payload when either the size threshold or the flush
@@ -43,10 +44,10 @@ public:
     /// @param timestampNs  Timestamp stored in the embedded DATA envelope.
     /// @param data         Raw payload bytes.
     /// @param length       Payload length.
-    void Push(Timestamp timestampNs, const void* data, uint32_t length);
+    Status Push(Timestamp timestampNs, const void* data, uint32_t length);
 
     /// Force a flush regardless of thresholds. No-op if the accumulator is empty.
-    void Flush();
+    Status Flush();
 
     /// Returns true if there are pending unflushed records.
     bool HasPending() const noexcept;

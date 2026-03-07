@@ -61,7 +61,7 @@ struct ReaderImpl {
 
     // Statistics
     uint64_t                CorruptCount = 0;
-    std::vector<uint64_t>   ChMsgCount;   ///< indexed by ChannelId
+    std::vector<uint64_t>   ChTotalCount; ///< indexed by ChannelId
 
     // Annotations collected at open
     std::vector<Annotation> Annots;
@@ -208,13 +208,21 @@ struct ReaderImpl {
                     const ChannelId ch = Le16ToHost(env->Channel);
                     if (ts < seg.StartNs) seg.StartNs = ts;
                     if (ts > seg.EndNs)   seg.EndNs   = ts;
-                    (void)ch;
+                    const size_t need = static_cast<size_t>(ch) + 1;
+                    if (ChTotalCount.size() < need)
+                        ChTotalCount.resize(need, 0);
+                    ++ChTotalCount[ch];
                     break;
                 }
                 case RecordOp::Chunk: {
                     if (payloadLen >= sizeof(format::ChunkHeader)) {
                         const auto* chdr = reinterpret_cast<const format::ChunkHeader*>(payload);
-                        (void)chdr;
+                        const ChannelId ch = Le16ToHost(env->Channel);
+                        const uint32_t recCnt = Le32ToHost(chdr->RecordCount);
+                        const size_t need = static_cast<size_t>(ch) + 1;
+                        if (ChTotalCount.size() < need)
+                            ChTotalCount.resize(need, 0);
+                        ChTotalCount[ch] += recCnt;
                     }
                     if (ts < seg.StartNs) seg.StartNs = ts;
                     if (ts > seg.EndNs)   seg.EndNs   = ts;
@@ -282,11 +290,6 @@ struct ReaderImpl {
                         ChunkBufPos += 12 + len;
                         ++ChunkRecIdx;
 
-                        const size_t need = static_cast<size_t>(ChunkChannel) + 1;
-                        if (ChMsgCount.size() < need)
-                            ChMsgCount.resize(need, 0);
-                        ++ChMsgCount[ChunkChannel];
-
                         if (ChunkRecIdx >= ChunkRecCnt) InChunk = false;
                         return true;
                     }
@@ -353,11 +356,6 @@ struct ReaderImpl {
                     out.TimestampNs = ts;
                     out.Data        = payload;
                     out.Length      = payloadLen;
-
-                    const size_t need = static_cast<size_t>(ch) + 1;
-                    if (ChMsgCount.size() < need)
-                        ChMsgCount.resize(need, 0);
-                    ++ChMsgCount[ch];
                     return true;
                 }
                 case RecordOp::Chunk: {
@@ -398,11 +396,6 @@ struct ReaderImpl {
                             out.Length      = innerLen;
                             ChunkBufPos += 12 + innerLen;
                             ++ChunkRecIdx;
-
-                            const size_t need = static_cast<size_t>(ChunkChannel) + 1;
-                            if (ChMsgCount.size() < need)
-                                ChMsgCount.resize(need, 0);
-                            ++ChMsgCount[ChunkChannel];
 
                             if (ChunkRecIdx >= ChunkRecCnt) InChunk = false;
                             return true;
@@ -509,6 +502,9 @@ Status ReaderSession::Open(const std::string& sessionPath) {
 
             impl->Segs.push_back(std::move(sd));
         }
+
+        if (impl->Segs.empty())
+            return Status::ErrorNotFound;
     }
 
     impl->CurSeg    = 0;
@@ -557,6 +553,7 @@ Status ReaderSession::Seek(Timestamp targetNs) {
 
     detail::ReaderImpl* p = m_Impl.get();
     p->InChunk = false;
+    if (p->Segs.empty()) return Status::ErrorNotFound;
 
     // Find the segment that covers targetNs (last segment whose StartNs <= targetNs)
     size_t segIdx = 0;
@@ -645,13 +642,13 @@ std::vector<Annotation> ReaderSession::Annotations(Timestamp startNs, Timestamp 
 uint64_t ReaderSession::TotalMessageCount() const noexcept {
     if (!m_Impl) return 0;
     uint64_t total = 0;
-    for (uint64_t c : m_Impl->ChMsgCount) total += c;
+    for (uint64_t c : m_Impl->ChTotalCount) total += c;
     return total;
 }
 
 uint64_t ReaderSession::MessageCount(ChannelId ch) const noexcept {
-    if (!m_Impl || ch >= m_Impl->ChMsgCount.size()) return 0;
-    return m_Impl->ChMsgCount[ch];
+    if (!m_Impl || ch >= m_Impl->ChTotalCount.size()) return 0;
+    return m_Impl->ChTotalCount[ch];
 }
 
 uint64_t ReaderSession::CorruptRecordCount() const noexcept {

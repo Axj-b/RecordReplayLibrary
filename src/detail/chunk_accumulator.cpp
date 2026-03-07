@@ -48,10 +48,11 @@ ChunkAccumulator::ChunkAccumulator(CompressionCodec   codec,
 
 ChunkAccumulator::~ChunkAccumulator() { delete m_Impl; }
 
-void ChunkAccumulator::Push(Timestamp timestampNs,
-                             const void* data,
-                             uint32_t    length) {
-    if (!m_Impl) return;
+Status ChunkAccumulator::Push(Timestamp timestampNs,
+                              const void* data,
+                              uint32_t    length) {
+    if (!m_Impl) return Status::ErrorInvalidArg;
+    if (length > 0 && data == nullptr) return Status::ErrorInvalidArg;
 
     // Append inner record: [ts:8][len:4][payload]
     const size_t pos = m_Impl->Buffer.size();
@@ -79,11 +80,14 @@ void ChunkAccumulator::Push(Timestamp timestampNs,
     }
 
     if (sizeExceeded || timeExceeded)
-        Flush();
+        return Flush();
+
+    return Status::Ok;
 }
 
-void ChunkAccumulator::Flush() {
-    if (!m_Impl || m_Impl->Buffer.empty()) return;
+Status ChunkAccumulator::Flush() {
+    if (!m_Impl) return Status::ErrorInvalidArg;
+    if (m_Impl->Buffer.empty()) return Status::Ok;
 
     const uint32_t uncompressedBytes = static_cast<uint32_t>(m_Impl->Buffer.size());
     const uint32_t recordCount       = m_Impl->RecordCount;
@@ -108,7 +112,7 @@ void ChunkAccumulator::Flush() {
                 }
             }
             // Fall through to raw on error
-            payload = std::move(m_Impl->Buffer);
+            payload = m_Impl->Buffer;
             break;
         }
 #endif
@@ -127,24 +131,27 @@ void ChunkAccumulator::Flush() {
                 break;
             }
             // Fall through to raw on error
-            payload = std::move(m_Impl->Buffer);
+            payload = m_Impl->Buffer;
             break;
         }
 #endif
 
         case CompressionCodec::None:
         default:
-            payload = std::move(m_Impl->Buffer);
+            payload = m_Impl->Buffer;
             break;
     }
 
-    // Reset accumulator state before calling the callback (re-entrancy safety)
+    if (m_Impl->OnFlush) {
+        const Status st = m_Impl->OnFlush(payload, uncompressedBytes, recordCount);
+        if (st != Status::Ok)
+            return st;
+    }
+
     m_Impl->Buffer.clear();
     m_Impl->RecordCount   = 0;
     m_Impl->LastFlushTime = std::chrono::steady_clock::now();
-
-    if (m_Impl->OnFlush)
-        m_Impl->OnFlush(payload, uncompressedBytes, recordCount);
+    return Status::Ok;
 }
 
 bool     ChunkAccumulator::HasPending()    const noexcept { return m_Impl && !m_Impl->Buffer.empty(); }

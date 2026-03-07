@@ -41,18 +41,25 @@ static std::string SanitiseName(const std::string& name) {
 
 /// Build an output session directory pattern like "{base}_{channelName}".
 static std::string MakeSplitDirName(const std::string& pattern,
-                                     const std::string& sessionBase,
-                                     const std::string& channelName) {
+                                    const std::string& sessionBase,
+                                    const std::string& channelName) {
     const std::string sanitised = SanitiseName(channelName);
     if (pattern.empty())
         return sessionBase + "_" + sanitised;
 
     std::string result = pattern;
-    const std::string placeholder = "{channel_name}";
-    for (size_t pos = 0; (pos = result.find(placeholder, pos)) != std::string::npos; ) {
-        result.replace(pos, placeholder.size(), sanitised);
-        pos += sanitised.size();
-    }
+
+    auto replace_all = [](std::string& text,
+                          const std::string& needle,
+                          const std::string& repl) {
+        for (size_t pos = 0; (pos = text.find(needle, pos)) != std::string::npos; ) {
+            text.replace(pos, needle.size(), repl);
+            pos += repl.size();
+        }
+    };
+
+    replace_all(result, "{channel_name}", sanitised);
+    replace_all(result, "{original_session_name}", sessionBase);
     return result;
 }
 
@@ -111,6 +118,11 @@ Status Splitter::Split(const std::string&  sourceSessionPath,
     };
 
     std::vector<OutSession> outs(toExtract.size());
+    auto close_outs_best_effort = [&]() {
+        for (auto& o : outs)
+            o.recorder.Close();
+    };
+
     for (size_t i = 0; i < toExtract.size(); ++i) {
         const ChannelDef& ch = toExtract[i];
         auto& o = outs[i];
@@ -118,7 +130,9 @@ Status Splitter::Split(const std::string&  sourceSessionPath,
         o.channelName = ch.Name;
 
         SessionConfig cfg;
-        cfg.OutputDir       = outputDir;
+        cfg.OutputDir       = opts.OneDirPerChannel
+                                  ? (outputDir + static_cast<char>(detail::PATH_SEP) + SanitiseName(ch.Name))
+                                  : outputDir;
         cfg.SessionName     = MakeSplitDirName(opts.OutputDirPattern, sessionBase, ch.Name);
         cfg.MaxSegmentBytes = opts.MaxSegmentBytes > 0
                                   ? opts.MaxSegmentBytes
@@ -129,8 +143,7 @@ Status Splitter::Split(const std::string&  sourceSessionPath,
 
         st = o.recorder.Open(cfg);
         if (st != Status::Ok) {
-            // clean up already opened
-            for (size_t j = 0; j < i; ++j) outs[j].recorder.Close();
+            close_outs_best_effort();
             return st;
         }
         o.sessionPath = o.recorder.SessionPath();
@@ -143,7 +156,11 @@ Status Splitter::Split(const std::string&  sourceSessionPath,
         ccfg.ChunkFlushIntervalMs = ch.ChunkFlushIntervalMs;
         ccfg.Schema             = ch.Schema;
         ccfg.UserMetadata       = ch.UserMetadata;
-        o.recorder.DefineChannel(ccfg, o.dstId);
+        st = o.recorder.DefineChannel(ccfg, o.dstId);
+        if (st != Status::Ok) {
+            close_outs_best_effort();
+            return st;
+        }
     }
 
     // Stream all messages — dispatch by channel
@@ -152,7 +169,11 @@ Status Splitter::Split(const std::string&  sourceSessionPath,
     while (src.ReadNext(msg)) {
         for (auto& o : outs) {
             if (o.srcId == msg.Channel) {
-                o.recorder.Write(o.dstId, msg.TimestampNs, msg.Data, msg.Length);
+                st = o.recorder.Write(o.dstId, msg.TimestampNs, msg.Data, msg.Length);
+                if (st != Status::Ok) {
+                    close_outs_best_effort();
+                    return st;
+                }
                 break;
             }
         }
@@ -166,8 +187,12 @@ Status Splitter::Split(const std::string&  sourceSessionPath,
         for (const auto& ann : src.Annotations()) {
             for (auto& o : outs) {
                 const void* meta = ann.Metadata.empty() ? nullptr : ann.Metadata.data();
-                o.recorder.Annotate(ann.TimestampNs, ann.Label,
-                                    meta, static_cast<uint32_t>(ann.Metadata.size()));
+                st = o.recorder.Annotate(ann.TimestampNs, ann.Label,
+                                         meta, static_cast<uint32_t>(ann.Metadata.size()));
+                if (st != Status::Ok) {
+                    close_outs_best_effort();
+                    return st;
+                }
             }
         }
     }
@@ -177,7 +202,8 @@ Status Splitter::Split(const std::string&  sourceSessionPath,
         const uint64_t msgCnt = o.recorder.MessagesWritten(o.dstId);
         const uint64_t bytes  = o.recorder.CurrentSegmentBytes();
         (void)bytes; // will be re-read from manifest after close
-        o.recorder.Close();
+        st = o.recorder.Close();
+        if (st != Status::Ok) return st;
 
         SplitResult::Entry entry{};
         entry.Channel      = o.srcId;
@@ -220,27 +246,36 @@ Status Splitter::Merge(const std::vector<std::string>& sources,
         if (st != Status::Ok) return st;
     }
 
-    // Build merged channel list; detect duplicates
-    std::vector<ChannelDef>                   mergedChannels;
-    std::vector<std::pair<size_t, ChannelId>> chMap; // {reader_idx, src_id} → dst_id index
+    // Build merged channel list and source->destination mapping.
+    struct SourceChannelMap {
+        size_t    ReaderIdx;
+        ChannelId SourceChannel;
+        size_t    MergedIndex;
+    };
+
+    std::vector<ChannelDef>      mergedChannels;
+    std::vector<SourceChannelMap> chMap;
 
     for (size_t ri = 0; ri < readers.size(); ++ri) {
         for (const ChannelDef& ch : readers[ri].Channels()) {
-            // Check for duplicate name
-            bool duplicate = false;
-            for (const auto& mc : mergedChannels) {
-                if (mc.Name == ch.Name) {
-                    if (!opts.MergeDuplicateChannelNames) return Status::ErrorInvalidArg;
-                    duplicate = true;
+            size_t mergedIndex = SIZE_MAX;
+            for (size_t mi = 0; mi < mergedChannels.size(); ++mi) {
+                if (mergedChannels[mi].Name == ch.Name) {
+                    mergedIndex = mi;
                     break;
                 }
             }
-            if (!duplicate) {
-                chMap.push_back({ri, ch.Id});
+
+            if (mergedIndex == SIZE_MAX) {
+                mergedIndex = mergedChannels.size();
                 ChannelDef copy = ch;
-                copy.Id = static_cast<ChannelId>(mergedChannels.size());
+                copy.Id = static_cast<ChannelId>(mergedIndex);
                 mergedChannels.push_back(std::move(copy));
+            } else if (!opts.MergeDuplicateChannelNames) {
+                return Status::ErrorInvalidArg;
             }
+
+            chMap.push_back({ri, ch.Id, mergedIndex});
         }
     }
 
@@ -267,19 +302,12 @@ Status Splitter::Merge(const std::vector<std::string>& sources,
         ccfg.ChunkFlushIntervalMs = mc.ChunkFlushIntervalMs;
         ccfg.Schema             = mc.Schema;
         ccfg.UserMetadata       = mc.UserMetadata;
-        dst.DefineChannel(ccfg, dstIds[i]);
+        st = dst.DefineChannel(ccfg, dstIds[i]);
+        if (st != Status::Ok) {
+            dst.Close();
+            return st;
+        }
     }
-
-    // Priority-queue merge by timestamp
-    // Item: {timestamp, reader_index, cached MessageView data}
-    struct Item {
-        Timestamp   Ts;
-        size_t      ReaderIdx;
-        ChannelId   SrcChannel;
-        std::vector<uint8_t> Payload;
-
-        bool operator>(const Item& o) const noexcept { return Ts > o.Ts; }
-    };
 
     // Buffer of the next unread message per reader
     std::vector<MessageView> heads(readers.size());
@@ -319,18 +347,25 @@ Status Splitter::Merge(const std::vector<std::string>& sources,
 
         // Map srcChannel → dstChannel
         ChannelId dstCh = INVALID_CHANNEL_ID;
-        const ChannelDef* srcDef = readers[best].FindChannel(mv.Channel);
-        if (srcDef) {
-            for (size_t i = 0; i < chMap.size(); ++i) {
-                if (chMap[i].first == best && chMap[i].second == mv.Channel) {
-                    dstCh = dstIds[i];
+        for (const auto& map : chMap) {
+            if (map.ReaderIdx == best && map.SourceChannel == mv.Channel) {
+                if (map.MergedIndex < dstIds.size()) {
+                    dstCh = dstIds[map.MergedIndex];
                     break;
                 }
             }
         }
 
-        if (dstCh != INVALID_CHANNEL_ID)
-            dst.Write(dstCh, mv.TimestampNs, mv.Data, mv.Length);
+        if (dstCh == INVALID_CHANNEL_ID) {
+            dst.Close();
+            return Status::ErrorCorrupted;
+        }
+
+        st = dst.Write(dstCh, mv.TimestampNs, mv.Data, mv.Length);
+        if (st != Status::Ok) {
+            dst.Close();
+            return st;
+        }
 
         bytesProcessed += mv.Length;
         ++totalMessages;
@@ -351,12 +386,17 @@ Status Splitter::Merge(const std::vector<std::string>& sources,
                       return a.TimestampNs < b.TimestampNs; });
         for (const auto& ann : allAnns) {
             const void* meta = ann.Metadata.empty() ? nullptr : ann.Metadata.data();
-            dst.Annotate(ann.TimestampNs, ann.Label,
-                         meta, static_cast<uint32_t>(ann.Metadata.size()));
+            st = dst.Annotate(ann.TimestampNs, ann.Label,
+                              meta, static_cast<uint32_t>(ann.Metadata.size()));
+            if (st != Status::Ok) {
+                dst.Close();
+                return st;
+            }
         }
     }
 
-    dst.Close();
+    st = dst.Close();
+    if (st != Status::Ok) return st;
 
     outResult.SessionPath        = dstPath;
     outResult.TotalMessageCount  = totalMessages;
@@ -618,9 +658,10 @@ Status Splitter::Recover(const std::string& sessionPath) {
             segInfo.SizeBytes = writer.BytesWritten();
             writer.Close();
 
-            // Atomically replace original
+            // Replace original (works on Windows where rename over an existing file can fail).
             try {
-                fs::rename(tmpPath, filepath);
+                fs::copy_file(tmpPath, filepath, fs::copy_options::overwrite_existing);
+                fs::remove(tmpPath);
                 anyRecovered = true;
             } catch (...) {
                 fs::remove(tmpPath);

@@ -10,6 +10,7 @@ This folder describes how `RecordReplayLibrary` is structured today, how data fl
 - [Runtime Flow Architecture](./runtime-flow-architecture.md)
 - [Viewer and Examples Architecture](./viewer-and-examples-architecture.md)
 - [Build and Test Architecture](./build-and-test-architecture.md)
+- [Architecture Gaps and Roadmap](./architecture-gaps-and-roadmap.md)
 
 ## Recommended Reading Order
 
